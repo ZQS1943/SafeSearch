@@ -1,0 +1,15 @@
+eval_results
+logs
+checkpoints
+wandb
+cache
+model
+data/eval
+data/finetune/utility
+data/finetune/safety/test.parquet
+data/finetune/safety/train.parquet
+data/FlashRAG_datasets
+data/redteaming-resistance-benchmark
+data/strongreject
+data/wildjailbreak
+data/tmp
