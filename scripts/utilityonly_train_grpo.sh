@@ -3,7 +3,7 @@ set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-export WANDB_PROJECT='SafeSearch'
+export WANDB_PROJECT='SafeSearch-GRPO'
 
 export KL='0.01'
 export LQ='0.01'
