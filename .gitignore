@@ -13,3 +13,5 @@ data/redteaming-resistance-benchmark
 data/strongreject
 data/wildjailbreak
 data/tmp
+*.pyc
+__pycache__/

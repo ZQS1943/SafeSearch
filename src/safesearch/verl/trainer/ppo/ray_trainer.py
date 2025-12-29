@@ -1005,13 +1005,75 @@ class RayPPOTrainer(object):
                         logger.log(data=val_metrics, step=self.global_steps)
                     return
     
+    def _compute_off_policy_seq_mask(self, batch):
+        """
+        Compute off-policy sequence mask based on DeepSeek-V3.2.
+        Masks sequences with negative advantages that have high KL divergence.
+
+        Returns:
+            off_policy_seq_mask: (bsz,) boolean tensor, True for sequences to keep, False for sequences to mask
+        """
+        # Get sequence-level advantages (sum over tokens)
+        response_length = batch.batch['responses'].shape[-1]
+        response_mask = batch.batch['attention_mask'][:, -response_length:]
+        advantages = batch.batch['advantages']  # (bsz, response_length)
+
+        # Compute sequence-level advantage (mean over valid tokens)
+        seq_advantages = (advantages * response_mask).sum(dim=1) / (response_mask.sum(dim=1) + 1e-8)
+
+        # Compute sequence-level KL divergence
+        old_log_probs = batch.batch['old_log_probs']  # (bsz, response_length)
+        # Note: new log probs need to be computed or passed in batch
+        # For now, we approximate using the ratio stored during compute_log_prob
+        # If new_log_probs are available in batch:
+        if 'new_log_probs' in batch.batch:
+            new_log_probs = batch.batch['new_log_probs']
+            kl_per_token = old_log_probs - new_log_probs  # Approximation of KL
+        else:
+            # If we don't have new_log_probs yet, we'll compute during the first forward pass
+            # For now, return all True (no masking) - this will be updated after log prob computation
+            return torch.ones(batch.batch['responses'].shape[0], dtype=torch.bool, device=batch.batch['responses'].device)
+
+        # Compute mean KL per sequence
+        seq_kl = (kl_per_token * response_mask).sum(dim=1) / (response_mask.sum(dim=1) + 1e-8)
+
+        # Apply masking criteria from DeepSeek-V3.2:
+        # 1. Only mask sequences with negative advantages
+        # 2. Among negative advantage sequences, mask those with KL > threshold
+        kl_threshold = self.config.actor_rollout_ref.actor.get('off_policy_kl_threshold', 0.1)
+
+        is_negative_advantage = seq_advantages < 0
+        is_high_kl = seq_kl > kl_threshold
+
+        # Mask sequences that are both negative advantage AND high KL
+        off_policy_mask = is_negative_advantage & is_high_kl
+
+        # Return True for sequences to KEEP (inverse of mask)
+        off_policy_seq_mask = ~off_policy_mask
+
+        return off_policy_seq_mask
+
     def _create_loss_mask(self, batch, metrics):
         """Create loss mask for state tokens."""
         response_length = batch.batch['responses'].shape[-1]
         response_mask = batch.batch['attention_mask'][:, -response_length:]
-        
+
         loss_mask = batch.batch['info_mask'][:, -response_length:]
         batch.batch['loss_mask'] = loss_mask
+
+        # Apply off-policy sequence masking if enabled
+        if self.config.actor_rollout_ref.actor.get('off_policy_seq_masking', False):
+            off_policy_seq_mask = self._compute_off_policy_seq_mask(batch)
+            batch.batch['off_policy_seq_mask'] = off_policy_seq_mask
+
+            # Update metrics for off-policy masking
+            num_masked = (~off_policy_seq_mask).sum().item()
+            total_seqs = off_policy_seq_mask.shape[0]
+            metrics.update({
+                'off_policy/num_masked_seqs': num_masked,
+                'off_policy/total_seqs': total_seqs,
+                'off_policy/mask_ratio': num_masked / (total_seqs + 1e-8),
+            })
         print(f"[Debug] {'*'*20} _create_loss_mask {'*'*20}")
         # print out the longest response with loss mask
         longest_idx = torch.argmax(response_mask.sum(-1)).item()

@@ -39,6 +39,9 @@ actor_rollout_ref:
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size
+    # Off-Policy Sequence Masking (DeepSeek-V3.2)
+    off_policy_seq_masking: False  # Enable off-policy sequence masking
+    off_policy_kl_threshold: 0.1  # KL threshold to identify off-policy sequences
     optim:
       lr: 1e-6
       lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
