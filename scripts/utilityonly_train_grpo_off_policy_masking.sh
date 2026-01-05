@@ -19,7 +19,7 @@ export BASE_MODEL="/scratch/qiusiz2/model/${MODEL}"
 # Off-Policy Sequence Masking parameters
 export OPM_ENABLED='true'
 export OPM_KL_THRESHOLD='0.1'  # KL threshold for masking (0.05-0.2 recommended)
-export EXPERIMENT_NAME="UtilityOnly-grpo-opm-${MODEL}-kl-${KL}-opmt-${OPM_KL_THRESHOLD}"
+export EXPERIMENT_NAME="UtilityOnly-grpo-opm-${MODEL}-kl-${KL}-opmt-${OPM_KL_THRESHOLD}-v2"
 
 export VLLM_ATTENTION_BACKEND=XFORMERS 
 

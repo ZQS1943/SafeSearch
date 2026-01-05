@@ -1012,6 +1012,7 @@ class RayPPOTrainer(object):
 
         Returns:
             off_policy_seq_mask: (bsz,) boolean tensor, True for sequences to keep, False for sequences to mask
+            metrics: dict with diagnostic metrics
         """
         # Get sequence-level advantages (sum over tokens)
         response_length = batch.batch['responses'].shape[-1]
@@ -1023,19 +1024,20 @@ class RayPPOTrainer(object):
 
         # Compute sequence-level KL divergence
         old_log_probs = batch.batch['old_log_probs']  # (bsz, response_length)
-        # Note: new log probs need to be computed or passed in batch
-        # For now, we approximate using the ratio stored during compute_log_prob
-        # If new_log_probs are available in batch:
-        if 'new_log_probs' in batch.batch:
-            new_log_probs = batch.batch['new_log_probs']
-            kl_per_token = old_log_probs - new_log_probs  # Approximation of KL
+
+        # Check if we have ref_log_prob (from reference policy) to compute proper KL
+        if 'ref_log_prob' in batch.batch:
+            # Use the KL that was already computed in apply_kl_penalty
+            # KL(π_old || π_ref) per token
+            kl_per_token = core_algos.kl_penalty(old_log_probs, batch.batch['ref_log_prob'], kl_penalty='kl')
+            kl_per_token = kl_per_token * response_mask
         else:
-            # If we don't have new_log_probs yet, we'll compute during the first forward pass
-            # For now, return all True (no masking) - this will be updated after log prob computation
-            return torch.ones(batch.batch['responses'].shape[0], dtype=torch.bool, device=batch.batch['responses'].device)
+            # Fallback: no masking if we don't have reference policy
+            print("[WARNING] off_policy_seq_masking enabled but no ref_log_prob available. Skipping masking.")
+            return torch.ones(batch.batch['responses'].shape[0], dtype=torch.bool, device=batch.batch['responses'].device), {}
 
         # Compute mean KL per sequence
-        seq_kl = (kl_per_token * response_mask).sum(dim=1) / (response_mask.sum(dim=1) + 1e-8)
+        seq_kl = (kl_per_token).sum(dim=1) / (response_mask.sum(dim=1) + 1e-8)
 
         # Apply masking criteria from DeepSeek-V3.2:
         # 1. Only mask sequences with negative advantages
@@ -1051,7 +1053,18 @@ class RayPPOTrainer(object):
         # Return True for sequences to KEEP (inverse of mask)
         off_policy_seq_mask = ~off_policy_mask
 
-        return off_policy_seq_mask
+        # Collect diagnostic metrics
+        metrics = {
+            'off_policy/num_negative_adv': is_negative_advantage.sum().item(),
+            'off_policy/num_high_kl': is_high_kl.sum().item(),
+            'off_policy/mean_seq_kl': seq_kl.mean().item(),
+            'off_policy/max_seq_kl': seq_kl.max().item(),
+            'off_policy/min_seq_adv': seq_advantages.min().item(),
+            'off_policy/max_seq_adv': seq_advantages.max().item(),
+            'off_policy/mean_seq_adv': seq_advantages.mean().item(),
+        }
+
+        return off_policy_seq_mask, metrics
 
     def _create_loss_mask(self, batch, metrics):
         """Create loss mask for state tokens."""
@@ -1063,7 +1076,7 @@ class RayPPOTrainer(object):
 
         # Apply off-policy sequence masking if enabled
         if self.config.actor_rollout_ref.actor.get('off_policy_seq_masking', False):
-            off_policy_seq_mask = self._compute_off_policy_seq_mask(batch)
+            off_policy_seq_mask, off_policy_metrics = self._compute_off_policy_seq_mask(batch)
             batch.batch['off_policy_seq_mask'] = off_policy_seq_mask
 
             # Update metrics for off-policy masking
@@ -1074,6 +1087,8 @@ class RayPPOTrainer(object):
                 'off_policy/total_seqs': total_seqs,
                 'off_policy/mask_ratio': num_masked / (total_seqs + 1e-8),
             })
+            # Add diagnostic metrics
+            metrics.update(off_policy_metrics)
         print(f"[Debug] {'*'*20} _create_loss_mask {'*'*20}")
         # print out the longest response with loss mask
         longest_idx = torch.argmax(response_mask.sum(-1)).item()
