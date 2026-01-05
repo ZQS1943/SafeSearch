@@ -150,73 +150,8 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.step()
         return grad_norm
 
-    def _compute_off_policy_mask_before_update(self, batch, temperature):
-        """
-        Compute off-policy sequence mask before policy update.
-        This method computes new log probs for all sequences and determines which
-        sequences should be masked based on KL divergence and advantages.
-
-        Based on DeepSeek-V3.2 Off-Policy Sequence Masking.
-        """
-        self.actor_module.eval()  # Set to eval for computing log probs
-
-        # Compute new log probs for KL estimation
-        micro_batch_size = self.config.ppo_micro_batch_size
-        micro_batches = batch.split(micro_batch_size)
-
-        all_new_log_probs = []
-        for micro_batch in micro_batches:
-            with torch.no_grad():
-                _, new_log_prob = self._forward_micro_batch(micro_batch=micro_batch, temperature=temperature)
-            all_new_log_probs.append(new_log_prob)
-
-        new_log_probs = torch.concat(all_new_log_probs, dim=0)  # (bsz, response_length)
-
-        # Compute sequence-level KL divergence
-        old_log_probs = batch['old_log_probs']  # (bsz, response_length)
-        response_length = batch['responses'].size(-1)
-        response_mask = batch['attention_mask'][:, -response_length:]
-
-        # KL divergence per token (approximation)
-        kl_per_token = old_log_probs - new_log_probs
-        seq_kl = (kl_per_token * response_mask).sum(dim=1) / (response_mask.sum(dim=1) + 1e-8)
-
-        # Get sequence-level advantages
-        advantages = batch['advantages']  # (bsz, response_length)
-        seq_advantages = (advantages * response_mask).sum(dim=1) / (response_mask.sum(dim=1) + 1e-8)
-
-        # Apply masking criteria: only mask negative advantage sequences with high KL
-        kl_threshold = self.config.get('off_policy_kl_threshold', 0.1)
-        is_negative_advantage = seq_advantages < 0
-        is_high_kl = seq_kl > kl_threshold
-
-        # Mask sequences that are both negative advantage AND high KL
-        off_policy_mask = is_negative_advantage & is_high_kl
-        off_policy_seq_mask = ~off_policy_mask  # True = keep, False = mask
-
-        # Store in batch
-        batch['off_policy_seq_mask'] = off_policy_seq_mask
-
-        # Collect metrics
-        num_masked = (~off_policy_seq_mask).sum().item()
-        total = off_policy_seq_mask.shape[0]
-
-        off_policy_metrics = {
-            'off_policy/num_masked_seqs': num_masked,
-            'off_policy/total_seqs': total,
-            'off_policy/mask_ratio': num_masked / (total + 1e-8),
-            'off_policy/mean_seq_kl': seq_kl.mean().item(),
-            'off_policy/max_seq_kl': seq_kl.max().item(),
-            'off_policy/num_negative_adv': is_negative_advantage.sum().item(),
-            'off_policy/num_high_kl': is_high_kl.sum().item(),
-        }
-
-        print(f"[Off-Policy Masking] Masked {num_masked}/{total} sequences ({100*num_masked/total:.1f}%)")
-        print(f"[Off-Policy Masking] Mean seq KL: {seq_kl.mean().item():.4f}, Max: {seq_kl.max().item():.4f}")
-        print(f"[Off-Policy Masking] Negative adv seqs: {is_negative_advantage.sum().item()}/{total}")
-
-        self.actor_module.train()  # Back to train mode
-        return batch, off_policy_metrics
+    # Note: Off-policy masking is now computed dynamically during forward pass (see update_policy)
+    # This approach is more accurate as it uses the actual log_probs computed during training
 
     def compute_log_prob(self, data: DataProto) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
@@ -281,9 +216,7 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('loss_mask')
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
-        # Off-Policy Sequence Masking: need sequence-level mask
-        if self.config.get('off_policy_seq_masking', False):
-            select_keys.append('off_policy_seq_mask')
+        # Note: off_policy_seq_mask is computed dynamically during forward pass, not loaded from batch
         batch = data.select(batch_keys=select_keys).batch
 
         # Split to make minibatch iterator for updating the actor
@@ -292,10 +225,21 @@ class DataParallelPPOActor(BasePPOActor):
 
         metrics = {}
 
-        # Off-Policy Sequence Masking: Pre-compute sequence-level KL and mask if enabled
+        # Track number of empty micro-batches (all sequences masked out)
+        num_empty_batches = 0
+        total_micro_batches = 0
+
+        # Track off-policy masking statistics across all micro-batches
         if self.config.get('off_policy_seq_masking', False):
-            batch, off_policy_metrics = self._compute_off_policy_mask_before_update(batch, temperature)
-            metrics.update(off_policy_metrics)
+            off_policy_stats = {
+                'num_masked_seqs': [],
+                'total_seqs': [],
+                'seq_kl_values': [],
+                'num_negative_adv': [],
+                'num_high_kl': [],
+            }
+        else:
+            off_policy_stats = None
 
         for batch_idx, data in enumerate(dataloader):
             # split batch into micro_batches
@@ -309,7 +253,8 @@ class DataParallelPPOActor(BasePPOActor):
 
             self.actor_optimizer.zero_grad()
 
-            for data in micro_batches:
+            for micro_batch_idx, data in enumerate(micro_batches):
+                total_micro_batches += 1
                 data = data.cuda()  # actor device is cpu when using offload
                 responses = data['responses']
                 response_length = responses.size(1)
@@ -317,12 +262,6 @@ class DataParallelPPOActor(BasePPOActor):
                 response_mask = attention_mask[:, -response_length:]
                 if self.config.state_masking:
                     response_mask = data['loss_mask']
-
-                # Off-Policy Sequence Masking: apply sequence-level mask
-                if self.config.get('off_policy_seq_masking', False):
-                    off_policy_seq_mask = data['off_policy_seq_mask']  # (bsz,) boolean mask
-                    # Expand to token-level: (bsz, response_length)
-                    response_mask = response_mask * off_policy_seq_mask.unsqueeze(1)
 
                 old_log_prob = data['old_log_probs']
                 advantages = data['advantages']
@@ -352,6 +291,50 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # all return: (bsz, response_length)
                 entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+
+                # Off-Policy Sequence Masking: Compute KL and apply dynamic masking
+                if self.config.get('off_policy_seq_masking', False):
+                    # IMPORTANT: Use torch.no_grad() to prevent gradient feedback loop
+                    # The masking decision should be based on current values, not influence gradients
+                    with torch.no_grad():
+                        # Compute denominator once for efficiency (minimum 1 to avoid division by zero)
+                        den = response_mask.sum(dim=1).clamp_min(1.0)
+
+                        # Compute sequence-level KL: KL(π_old || π_current) ≈ old_log_prob - log_prob
+                        # Note: No need for .detach() since we're already in no_grad() context
+                        kl_per_token = old_log_prob - log_prob
+                        seq_kl = (kl_per_token * response_mask).sum(dim=1) / den
+
+                        # Compute sequence-level advantages
+                        seq_advantages = (advantages * response_mask).sum(dim=1) / den
+
+                        # Apply masking: sequences with negative advantages AND high KL
+                        kl_threshold = self.config.get('off_policy_kl_threshold', 0.1)
+                        is_negative_advantage = seq_advantages < 0
+                        is_high_kl = seq_kl > kl_threshold
+                        off_policy_mask = is_negative_advantage & is_high_kl
+                        off_policy_seq_mask = ~off_policy_mask  # True = keep, False = mask
+
+                    # Apply sequence-level mask to response_mask (mask is now gradient-free)
+                    response_mask = response_mask * off_policy_seq_mask.unsqueeze(1)
+
+                    # Collect statistics from this micro-batch
+                    if off_policy_stats is not None:
+                        num_masked = (~off_policy_seq_mask).sum().item()
+                        total = off_policy_seq_mask.shape[0]
+                        off_policy_stats['num_masked_seqs'].append(num_masked)
+                        off_policy_stats['total_seqs'].append(total)
+                        off_policy_stats['seq_kl_values'].extend(seq_kl.cpu().tolist())  # Collect all KL values
+                        off_policy_stats['num_negative_adv'].append(is_negative_advantage.sum().item())
+                        off_policy_stats['num_high_kl'].append(is_high_kl.sum().item())
+
+                # Check if all sequences were masked out by off-policy filtering
+                if response_mask.sum() == 0:
+                    num_empty_batches += 1
+                    print(f"[WARNING] All sequences masked out in micro-batch (batch_idx={batch_idx}, micro_batch_idx={micro_batch_idx})")
+                    if self.config.get('off_policy_seq_masking', False):
+                        print(f"[WARNING] Off-policy masking too aggressive - consider lowering off_policy_kl_threshold")
+                    continue  # Skip this micro-batch
 
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                               log_prob=log_prob,
@@ -390,5 +373,42 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = self._optimizer_step()
             data = {'actor/grad_norm': grad_norm.detach().item()}
             append_to_dict(metrics, data)
+
+        # Aggregate and add off-policy masking metrics
+        if self.config.get('off_policy_seq_masking', False) and off_policy_stats is not None:
+            import numpy as np
+
+            # Aggregate counts across all micro-batches
+            total_masked = sum(off_policy_stats['num_masked_seqs'])
+            total_sequences = sum(off_policy_stats['total_seqs'])
+            total_negative_adv = sum(off_policy_stats['num_negative_adv'])
+            total_high_kl = sum(off_policy_stats['num_high_kl'])
+
+            # Compute statistics on KL values
+            all_kl_values = np.array(off_policy_stats['seq_kl_values'])
+
+            metrics.update({
+                # Masking statistics
+                'off_policy/num_masked_seqs': total_masked,
+                'off_policy/total_seqs': total_sequences,
+                'off_policy/mask_ratio': total_masked / (total_sequences + 1e-8),
+
+                # KL divergence statistics (across all sequences)
+                'off_policy/mean_seq_kl': float(all_kl_values.mean()) if len(all_kl_values) > 0 else 0.0,
+                'off_policy/max_seq_kl': float(all_kl_values.max()) if len(all_kl_values) > 0 else 0.0,
+                'off_policy/min_seq_kl': float(all_kl_values.min()) if len(all_kl_values) > 0 else 0.0,
+                'off_policy/std_seq_kl': float(all_kl_values.std()) if len(all_kl_values) > 0 else 0.0,
+                'off_policy/median_seq_kl': float(np.median(all_kl_values)) if len(all_kl_values) > 0 else 0.0,
+
+                # Sequence classification counts
+                'off_policy/num_negative_adv': total_negative_adv,
+                'off_policy/num_high_kl': total_high_kl,
+
+                # Empty batch tracking
+                'off_policy/num_empty_batches': num_empty_batches,
+                'off_policy/total_micro_batches': total_micro_batches,
+                'off_policy/empty_batch_ratio': num_empty_batches / (total_micro_batches + 1e-8),
+            })
+
         self.actor_optimizer.zero_grad()
         return metrics

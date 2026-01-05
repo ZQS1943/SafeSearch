@@ -1004,67 +1004,10 @@ class RayPPOTrainer(object):
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
                     return
-    
-    def _compute_off_policy_seq_mask(self, batch):
-        """
-        Compute off-policy sequence mask based on DeepSeek-V3.2.
-        Masks sequences with negative advantages that have high KL divergence.
 
-        Returns:
-            off_policy_seq_mask: (bsz,) boolean tensor, True for sequences to keep, False for sequences to mask
-            metrics: dict with diagnostic metrics
-        """
-        # Get sequence-level advantages (sum over tokens)
-        response_length = batch.batch['responses'].shape[-1]
-        response_mask = batch.batch['attention_mask'][:, -response_length:]
-        advantages = batch.batch['advantages']  # (bsz, response_length)
-
-        # Compute sequence-level advantage (mean over valid tokens)
-        seq_advantages = (advantages * response_mask).sum(dim=1) / (response_mask.sum(dim=1) + 1e-8)
-
-        # Compute sequence-level KL divergence
-        old_log_probs = batch.batch['old_log_probs']  # (bsz, response_length)
-
-        # Check if we have ref_log_prob (from reference policy) to compute proper KL
-        if 'ref_log_prob' in batch.batch:
-            # Use the KL that was already computed in apply_kl_penalty
-            # KL(π_old || π_ref) per token
-            kl_per_token = core_algos.kl_penalty(old_log_probs, batch.batch['ref_log_prob'], kl_penalty='kl')
-            kl_per_token = kl_per_token * response_mask
-        else:
-            # Fallback: no masking if we don't have reference policy
-            print("[WARNING] off_policy_seq_masking enabled but no ref_log_prob available. Skipping masking.")
-            return torch.ones(batch.batch['responses'].shape[0], dtype=torch.bool, device=batch.batch['responses'].device), {}
-
-        # Compute mean KL per sequence
-        seq_kl = (kl_per_token).sum(dim=1) / (response_mask.sum(dim=1) + 1e-8)
-
-        # Apply masking criteria from DeepSeek-V3.2:
-        # 1. Only mask sequences with negative advantages
-        # 2. Among negative advantage sequences, mask those with KL > threshold
-        kl_threshold = self.config.actor_rollout_ref.actor.get('off_policy_kl_threshold', 0.1)
-
-        is_negative_advantage = seq_advantages < 0
-        is_high_kl = seq_kl > kl_threshold
-
-        # Mask sequences that are both negative advantage AND high KL
-        off_policy_mask = is_negative_advantage & is_high_kl
-
-        # Return True for sequences to KEEP (inverse of mask)
-        off_policy_seq_mask = ~off_policy_mask
-
-        # Collect diagnostic metrics
-        metrics = {
-            'off_policy/num_negative_adv': is_negative_advantage.sum().item(),
-            'off_policy/num_high_kl': is_high_kl.sum().item(),
-            'off_policy/mean_seq_kl': seq_kl.mean().item(),
-            'off_policy/max_seq_kl': seq_kl.max().item(),
-            'off_policy/min_seq_adv': seq_advantages.min().item(),
-            'off_policy/max_seq_adv': seq_advantages.max().item(),
-            'off_policy/mean_seq_adv': seq_advantages.mean().item(),
-        }
-
-        return off_policy_seq_mask, metrics
+    # Note: Off-policy sequence masking is implemented dynamically during forward pass in dp_actor.update_policy
+    # where it computes KL using actual log_probs from the current policy (not available here in the trainer).
+    # See src/safesearch/verl/workers/actor/dp_actor.py lines 278-298
 
     def _create_loss_mask(self, batch, metrics):
         """Create loss mask for state tokens."""
@@ -1074,21 +1017,9 @@ class RayPPOTrainer(object):
         loss_mask = batch.batch['info_mask'][:, -response_length:]
         batch.batch['loss_mask'] = loss_mask
 
-        # Apply off-policy sequence masking if enabled
-        if self.config.actor_rollout_ref.actor.get('off_policy_seq_masking', False):
-            off_policy_seq_mask, off_policy_metrics = self._compute_off_policy_seq_mask(batch)
-            batch.batch['off_policy_seq_mask'] = off_policy_seq_mask
-
-            # Update metrics for off-policy masking
-            num_masked = (~off_policy_seq_mask).sum().item()
-            total_seqs = off_policy_seq_mask.shape[0]
-            metrics.update({
-                'off_policy/num_masked_seqs': num_masked,
-                'off_policy/total_seqs': total_seqs,
-                'off_policy/mask_ratio': num_masked / (total_seqs + 1e-8),
-            })
-            # Add diagnostic metrics
-            metrics.update(off_policy_metrics)
+        # Note: Off-policy sequence masking is handled dynamically during forward pass in the actor worker
+        # (see dp_actor.update_policy lines 278-298), where it has access to current policy log probs.
+        # No need to compute it here in the trainer.
         print(f"[Debug] {'*'*20} _create_loss_mask {'*'*20}")
         # print out the longest response with loss mask
         longest_idx = torch.argmax(response_mask.sum(-1)).item()
