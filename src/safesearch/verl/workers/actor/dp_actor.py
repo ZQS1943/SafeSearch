@@ -359,6 +359,55 @@ class DataParallelPPOActor(BasePPOActor):
                     metrics['actor/kl_loss'] = kl_loss.detach().item()
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
+                # LLDS (Lazy Likelihood Displacement Stabilization)
+                # Paper: arXiv:2512.04220 - Prevents GRPO collapse in search-augmented RL
+                if self.config.get('use_llds', False):
+                    # 1. Compute likelihood change per token (positive = likelihood decreased)
+                    likelihood_decrease = old_log_prob - log_prob
+
+                    # 2. Response-level gating: activate only if total likelihood decreased
+                    response_total_likelihood_change = (likelihood_decrease * response_mask).sum(dim=1)
+                    response_gate = (response_total_likelihood_change > 0).float().unsqueeze(1)  # [batch, 1]
+
+                    # 3. Token-level selectivity: penalize only likelihood-reducing tokens
+                    token_gate = (likelihood_decrease > 0).float()  # [batch, seq_len]
+
+                    # 4. Advantage gate: apply only to responses with advantage >= 0
+                    # Compute sequence-level advantages
+                    seq_advantages = (advantages * response_mask).sum(dim=1) / response_mask.sum(dim=1).clamp_min(1.0)
+                    advantage_gate = (seq_advantages >= 0).float().unsqueeze(1)
+
+                    # 5. Combine all gates with response mask
+                    llds_mask = response_gate * token_gate * advantage_gate * response_mask
+
+                    # 6. Optional: LLDS-MA variant - mask final answer tokens
+                    # Note: This only applies if state_masking is NOT already enabled
+                    # If state_masking=true, response_mask already uses loss_mask (line 264)
+                    if self.config.get('llds_mask_answer', False) and not self.config.state_masking:
+                        # loss_mask identifies state tokens (non-answer tokens)
+                        # Apply it to exclude final answer tokens from LLDS regularization
+                        if 'loss_mask' in data:
+                            state_mask = data['loss_mask']
+                            llds_mask = llds_mask * state_mask
+
+                    # 7. Compute LLDS loss
+                    llds_active_tokens = llds_mask.sum()
+                    if llds_active_tokens > 0:
+                        llds_loss = (likelihood_decrease * llds_mask).sum() / llds_active_tokens
+                    else:
+                        llds_loss = torch.tensor(0.0, device=likelihood_decrease.device)
+
+                    # 8. Add to policy loss
+                    llds_lambda = self.config.get('llds_lambda', 0.1)
+                    policy_loss = policy_loss + llds_lambda * llds_loss
+
+                    # 9. Track metrics
+                    metrics['actor/llds_loss'] = llds_loss.detach().item()
+                    metrics['actor/llds_lambda'] = llds_lambda
+                    metrics['actor/llds_active_ratio'] = (llds_active_tokens / response_mask.sum()).item()
+                    metrics['actor/llds_response_gate_ratio'] = response_gate.sum().item() / response_gate.shape[0]
+                    metrics['actor/llds_advantage_gate_ratio'] = advantage_gate.sum().item() / advantage_gate.shape[0]
+
                 loss = policy_loss / self.gradient_accumulation
                 loss.backward()
 
